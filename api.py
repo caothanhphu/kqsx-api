@@ -33,6 +33,18 @@ def load_env_file(path: str = ".env") -> None:
 load_env_file()
 
 
+def normalize_env_quotes() -> None:
+    for key, value in list(os.environ.items()):
+        if not value:
+            continue
+        stripped = value.strip()
+        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", '"'}:
+            os.environ[key] = stripped[1:-1]
+
+
+normalize_env_quotes()
+
+
 class PrizeSummary(BaseModel):
     label: str
     level: str
