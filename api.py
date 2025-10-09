@@ -1,7 +1,8 @@
 import datetime as dt
+import logging
 import os
 from functools import lru_cache
-from typing import Annotated, Any, Dict, Iterable, List, Optional, Tuple
+from typing import Annotated, Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
@@ -43,6 +44,9 @@ def normalize_env_quotes() -> None:
 
 
 normalize_env_quotes()
+
+
+logger = logging.getLogger("kqsx_api")
 
 
 class PrizeSummary(BaseModel):
@@ -211,20 +215,71 @@ def fetch_draws_for_date(target_date: dt.date, region: str) -> List[Dict[str, An
     return filtered
 
 
+def trigger_scrape_for_region(target_date: dt.date, region: str) -> bool:
+    try:
+        from scraper import run as scraper_run
+    except Exception as exc:  # ImportError or circular issues
+        logger.exception("Unable to import scraper module: %s", exc)
+        return False
+
+    try:
+        logger.info(
+            "Triggering scraper for region=%s date=%s",
+            region,
+            target_date.isoformat(),
+        )
+        scraper_run(target_date.isoformat(), region, out_path=None, use_supabase=True)
+        logger.info(
+            "Scraper completed for region=%s date=%s",
+            region,
+            target_date.isoformat(),
+        )
+        return True
+    except Exception as exc:
+        logger.exception(
+            "Scraper run failed for region=%s date=%s: %s",
+            region,
+            target_date.isoformat(),
+            exc,
+        )
+        return False
+
+
 def gather_draws_for_regions(
     requested_date: dt.date,
     regions: List[str],
     fallback_limit: int = DEFAULT_FALLBACK_DAYS,
 ) -> Tuple[dt.date, int, Dict[str, List[Dict[str, Any]]]]:
-    for offset in range(0, fallback_limit + 1):
+    attempted_scrape: Set[str] = set()
+    offset = 0
+    while offset <= fallback_limit:
         candidate_date = requested_date - dt.timedelta(days=offset)
         region_draws: Dict[str, List[Dict[str, Any]]] = {}
+        missing_regions: List[str] = []
+
         for region in regions:
             draws = fetch_draws_for_date(candidate_date, region)
             if draws:
                 region_draws[region] = draws
+            else:
+                missing_regions.append(region)
+
         if region_draws:
             return candidate_date, offset, region_draws
+
+        if offset == 0 and missing_regions:
+            attempted_any = False
+            for region in missing_regions:
+                if region in attempted_scrape:
+                    continue
+                attempted_scrape.add(region)
+                attempted_any = True
+                trigger_scrape_for_region(candidate_date, region)
+            if attempted_any:
+                # Re-evaluate the same date after scraping attempts.
+                continue
+
+        offset += 1
     raise HTTPException(status_code=404, detail="Không tìm thấy dữ liệu xổ số cho yêu cầu.")
 
 
