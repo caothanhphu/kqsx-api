@@ -5,3 +5,4 @@ langchain-core
 scrapegraphai
 fastapi
 uvicorn
+cachetools

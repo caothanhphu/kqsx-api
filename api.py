@@ -3,10 +3,12 @@ import logging
 import os
 from functools import lru_cache
 from typing import Annotated, Any, Dict, Iterable, List, Optional, Set, Tuple
+from threading import RLock
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
+from cachetools import TTLCache
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -153,6 +155,35 @@ REGION_CONFIG: Dict[str, Dict[str, Any]] = {
 DEFAULT_FALLBACK_DAYS = 2
 REGION_ORDER = {region_key: idx for idx, region_key in enumerate(REGION_CONFIG.keys())}
 
+CACHE_TTL_SECONDS = 60 * 60 * 24 * 10  # 10 days
+_draw_cache: TTLCache = TTLCache(maxsize=512, ttl=CACHE_TTL_SECONDS)
+_cache_lock = RLock()
+
+
+def cache_key(date_value: dt.date, region: str) -> str:
+    return f"{region}:{date_value.isoformat()}"
+
+
+def get_cached_draws(date_value: dt.date, region: str) -> Optional[List[Dict[str, Any]]]:
+    key = cache_key(date_value, region)
+    with _cache_lock:
+        try:
+            return _draw_cache[key]
+        except KeyError:
+            return None
+
+
+def set_cached_draws(date_value: dt.date, region: str, draws: List[Dict[str, Any]]) -> None:
+    key = cache_key(date_value, region)
+    with _cache_lock:
+        _draw_cache[key] = draws
+
+
+def invalidate_draw_cache(date_value: dt.date, region: str) -> None:
+    key = cache_key(date_value, region)
+    with _cache_lock:
+        _draw_cache.pop(key, None)
+
 
 @lru_cache()
 def supabase_config() -> Dict[str, Any]:
@@ -193,6 +224,11 @@ def parse_date(date_str: Optional[str]) -> dt.date:
 
 def fetch_draws_for_date(target_date: dt.date, region: str) -> List[Dict[str, Any]]:
     region_info = REGION_CONFIG[region]
+
+    cached = get_cached_draws(target_date, region)
+    if cached is not None:
+        return cached
+
     params = {
         "draw_date": f"eq.{target_date.isoformat()}",
         "select": (
@@ -212,6 +248,8 @@ def fetch_draws_for_date(target_date: dt.date, region: str) -> List[Dict[str, An
         if prefix and game_code and not game_code.startswith(prefix):
             continue
         filtered.append(item)
+
+    set_cached_draws(target_date, region, filtered)
     return filtered
 
 
@@ -228,12 +266,14 @@ def trigger_scrape_for_region(target_date: dt.date, region: str) -> bool:
             region,
             target_date.isoformat(),
         )
+        invalidate_draw_cache(target_date, region)
         scraper_run(target_date.isoformat(), region, out_path=None, use_supabase=True)
         logger.info(
             "Scraper completed for region=%s date=%s",
             region,
             target_date.isoformat(),
         )
+        invalidate_draw_cache(target_date, region)
         return True
     except Exception as exc:
         logger.exception(
@@ -426,7 +466,7 @@ def privacy_policy() -> PrivacyPolicyResponse:
     return PrivacyPolicyResponse(
         title="Chính sách quyền riêng tư",
         description=(
-            "Ứng dụng này chỉ thu thập và hiển thị dữ liệu kết quả xổ số được cung cấp từ Supabase. "
+            "Ứng dụng này chỉ thu thập và hiển thị dữ liệu kết quả xổ số. "
             "Chúng tôi không yêu cầu, lưu trữ hay xử lý thông tin cá nhân của người dùng."
         ),
         data_usage=(
@@ -437,7 +477,7 @@ def privacy_policy() -> PrivacyPolicyResponse:
             "Kết quả xổ số được cung cấp mang tính tham khảo. Người dùng nên đối chiếu với nguồn chính thức "
             "khi cần xác minh."
         ),
-        contact="Liên hệ: support@kqsx.local",
+        contact="Liên hệ: clientsupport@pmsa.com.vn",
         last_updated=today_iso,
     )
 
