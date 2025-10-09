@@ -6,6 +6,7 @@ FastAPI service that surfaces Vietnamese lottery (Kết quả xổ số) summari
 - `/v1/kqsx/summary` returns a structured object + LLM-friendly text for daily results (per region or nationwide fallback).
 - Automatically triggers the bundled scraper to fetch and publish fresh results to Supabase when the requested date is missing.
 - Caches per-day/per-region responses in memory for 10 days to minimize Supabase load.
+- `/v1/random_numbers` provides a playful random number generator with optional unique draws.
 - `/privacy_policy` exposes the privacy notice required for OpenAI action submissions.
 - Reads Supabase data via REST API using environment variables defined in `.env`.
 - Docker image based on Python 3.11, serving with uvicorn on port 8090.
@@ -45,6 +46,7 @@ docker run --rm -p 8090:8090 --env-file .env kqsx-api
 
 ## API Endpoints
 - `GET /healthz` – Service status.
+- `GET /v1/random_numbers?min_value=0&max_value=99&count=1&unique=false` – Quick random number generator (optionally unique results).
 - `GET /privacy_policy` – Privacy policy payload.
 - `GET /v1/kqsx/summary?date=YYYY-MM-DD&region=mn|mt|mb` – Lottery summary for the given day. Omit `region` to merge all regions; the endpoint will fallback to recent days if requested date has no data. The API will attempt an on-demand scrape (and Supabase sync) for the requested date before falling back.
 

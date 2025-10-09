@@ -1,6 +1,7 @@
 import datetime as dt
 import logging
 import os
+import random
 from functools import lru_cache
 from typing import Annotated, Any, Dict, Iterable, List, Optional, Set, Tuple
 from threading import RLock
@@ -87,6 +88,14 @@ class PrivacyPolicyResponse(BaseModel):
     limitations: str
     contact: str
     last_updated: str
+
+
+class RandomNumberResponse(BaseModel):
+    min_value: int
+    max_value: int
+    count: int
+    unique: bool
+    numbers: List[int]
 
 
 PRIZE_DISPLAY_LABELS: Dict[str, str] = {
@@ -455,6 +464,40 @@ app = FastAPI(title="KQSX API", version="0.1.0")
 @app.get("/healthz")
 def healthcheck() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get(
+    "/v1/random_numbers",
+    response_model=RandomNumberResponse,
+)
+def random_numbers(
+    min_value: Annotated[int, Query(ge=0, description="Giá trị nhỏ nhất (mặc định 0).")] = 0,
+    max_value: Annotated[int, Query(gt=0, description="Giá trị lớn nhất (mặc định 99).")] = 99,
+    count: Annotated[int, Query(gt=0, le=20, description="Số lượng số cần lấy (tối đa 20).")] = 1,
+    unique: Annotated[bool, Query(description="Tránh trùng lặp số nếu đặt thành true.")] = False,
+) -> RandomNumberResponse:
+    if min_value > max_value:
+        raise HTTPException(status_code=422, detail="min_value phải nhỏ hơn hoặc bằng max_value.")
+
+    span = max_value - min_value + 1
+    if unique and count > span:
+        raise HTTPException(
+            status_code=422,
+            detail="Không thể tạo đủ số ngẫu nhiên không trùng lặp trong khoảng đã cho.",
+        )
+
+    if unique:
+        numbers = random.sample(range(min_value, max_value + 1), count)
+    else:
+        numbers = [random.randint(min_value, max_value) for _ in range(count)]
+
+    return RandomNumberResponse(
+        min_value=min_value,
+        max_value=max_value,
+        count=count,
+        unique=unique,
+        numbers=numbers,
+    )
 
 
 @app.get(
