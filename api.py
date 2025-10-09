@@ -1,0 +1,420 @@
+import datetime as dt
+import os
+from functools import lru_cache
+from typing import Annotated, Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+
+
+def load_env_file(path: str = ".env") -> None:
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :]
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key:
+                continue
+            value = value.strip()
+            if value and value[0] in {"'", '"'} and value[-1] == value[0]:
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
+load_env_file()
+
+
+class PrizeSummary(BaseModel):
+    label: str
+    level: str
+    numbers: List[str]
+
+
+class DrawSummary(BaseModel):
+    region: str
+    region_label: str
+    province_code: Optional[str] = None
+    province_name: str
+    operator: Optional[str] = None
+    game_code: Optional[str] = None
+    game_name: Optional[str] = None
+    sequence: int
+    prizes: List[PrizeSummary]
+    source_url: Optional[str] = None
+
+
+class LotterySummaryResponse(BaseModel):
+    requested_date: str
+    date: str
+    region: str
+    region_label: str
+    draws: List[DrawSummary]
+    summary_text: str
+    fallback_offset_days: int
+
+
+class PrivacyPolicyResponse(BaseModel):
+    title: str
+    description: str
+    data_usage: str
+    limitations: str
+    contact: str
+    last_updated: str
+
+
+PRIZE_DISPLAY_LABELS: Dict[str, str] = {
+    "eighth": "Giải 8",
+    "seventh": "Giải 7",
+    "sixth": "Giải 6",
+    "fifth": "Giải 5",
+    "fourth": "Giải 4",
+    "third": "Giải 3",
+    "second": "Giải 2",
+    "first": "Giải 1",
+    "special": "Giải Đặc Biệt",
+    "consolation": "Giải Khuyến Khích",
+    "jackpot": "Giải Jackpot",
+    "other": "Giải Khác",
+}
+
+REGION_CONFIG: Dict[str, Dict[str, Any]] = {
+    "mn": {
+        "label": "Miền Nam",
+        "code_prefix": "xs_mn_",
+        "prize_order": [
+            "eighth",
+            "seventh",
+            "sixth",
+            "fifth",
+            "fourth",
+            "third",
+            "second",
+            "first",
+            "special",
+        ],
+    },
+    "mt": {
+        "label": "Miền Trung",
+        "code_prefix": "xs_mt_",
+        "prize_order": [
+            "eighth",
+            "seventh",
+            "sixth",
+            "fifth",
+            "fourth",
+            "third",
+            "second",
+            "first",
+            "special",
+        ],
+    },
+    "mb": {
+        "label": "Miền Bắc",
+        "code_prefix": "xs_mb_",
+        "prize_order": [
+            "special",
+            "first",
+            "second",
+            "third",
+            "fourth",
+            "fifth",
+            "sixth",
+            "seventh",
+        ],
+    },
+}
+
+
+DEFAULT_FALLBACK_DAYS = 2
+REGION_ORDER = {region_key: idx for idx, region_key in enumerate(REGION_CONFIG.keys())}
+
+
+@lru_cache()
+def supabase_config() -> Dict[str, Any]:
+    base_url = os.environ.get("VITE_SUPABASE_URL")
+    api_key = os.environ.get("VITE_SUPABASE_SERVICE_ROLE_KEY") or os.environ.get(
+        "VITE_SUPABASE_PUBLISHABLE_KEY"
+    )
+    if not base_url or not api_key:
+        raise RuntimeError("Supabase configuration is missing environment variables.")
+    base_url = base_url.rstrip("/")
+    headers = {
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+    }
+    return {"rest_url": f"{base_url}/rest/v1", "headers": headers}
+
+
+def supabase_get(resource: str, params: Dict[str, str]) -> Any:
+    cfg = supabase_config()
+    url = f"{cfg['rest_url']}/{resource}"
+    response = requests.get(url, headers=cfg["headers"], params=params, timeout=20)
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Supabase request failed for {resource}: {response.text}",
+        )
+    return response.json()
+
+
+def parse_date(date_str: Optional[str]) -> dt.date:
+    if not date_str:
+        return dt.date.today()
+    try:
+        return dt.date.fromisoformat(date_str)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid date format, expected YYYY-MM-DD.") from exc
+
+
+def fetch_draws_for_date(target_date: dt.date, region: str) -> List[Dict[str, Any]]:
+    region_info = REGION_CONFIG[region]
+    params = {
+        "draw_date": f"eq.{target_date.isoformat()}",
+        "select": (
+            "id,draw_date,sequence,source_url,"
+            "lottery_games(code,name,operator,metadata,province_id),"
+            "draw_prizes(id,prize_level,prize_order,prize_name,"
+            "draw_results(result_numbers,bonus_numbers,province_id))"
+        ),
+        "order": "sequence.asc",
+    }
+    data = supabase_get("draws", params)
+    prefix = region_info["code_prefix"]
+    filtered = []
+    for item in data:
+        game = item.get("lottery_games") or {}
+        game_code = (game.get("code") or "").lower()
+        if prefix and game_code and not game_code.startswith(prefix):
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def gather_draws_for_regions(
+    requested_date: dt.date,
+    regions: List[str],
+    fallback_limit: int = DEFAULT_FALLBACK_DAYS,
+) -> Tuple[dt.date, int, Dict[str, List[Dict[str, Any]]]]:
+    for offset in range(0, fallback_limit + 1):
+        candidate_date = requested_date - dt.timedelta(days=offset)
+        region_draws: Dict[str, List[Dict[str, Any]]] = {}
+        for region in regions:
+            draws = fetch_draws_for_date(candidate_date, region)
+            if draws:
+                region_draws[region] = draws
+        if region_draws:
+            return candidate_date, offset, region_draws
+    raise HTTPException(status_code=404, detail="Không tìm thấy dữ liệu xổ số cho yêu cầu.")
+
+
+def format_game_code(game_code: Optional[str]) -> Optional[str]:
+    if not game_code:
+        return None
+    if game_code.startswith("xs_"):
+        game_code = game_code[3:]
+    return game_code.upper().replace("_", " ")
+
+
+def collect_province_map(draws: Iterable[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    province_ids: List[int] = []
+    for item in draws:
+        game = item.get("lottery_games") or {}
+        province_id = game.get("province_id")
+        if isinstance(province_id, int):
+            province_ids.append(province_id)
+    unique_ids = sorted({pid for pid in province_ids})
+    if not unique_ids:
+        return {}
+    id_list = ",".join(str(pid) for pid in unique_ids)
+    provinces = supabase_get("provinces", {"id": f"in.({id_list})", "select": "id,code,name"})
+    return {prov["id"]: prov for prov in provinces}
+
+
+def build_draw_summaries(draws: List[Dict[str, Any]], region: str) -> List[DrawSummary]:
+    province_lookup = collect_province_map(draws)
+    region_info = REGION_CONFIG[region]
+    prize_order = region_info["prize_order"]
+    summaries: List[DrawSummary] = []
+
+    for item in draws:
+        game = item.get("lottery_games") or {}
+        province_id = game.get("province_id")
+        province_meta = province_lookup.get(province_id, {})
+        metadata = game.get("metadata") or {}
+        province_code = province_meta.get("code") or metadata.get("province_code")
+        province_name = province_meta.get("name") or game.get("name") or "Không rõ"
+
+        raw_prizes = item.get("draw_prizes") or []
+        prizes: List[PrizeSummary] = []
+
+        for level in prize_order:
+            level_entries = [
+                entry for entry in raw_prizes if entry.get("prize_level") == level
+            ]
+            if not level_entries:
+                continue
+            level_entries.sort(key=lambda entry: entry.get("prize_order") or 0)
+            for entry in level_entries:
+                numbers: List[str] = []
+                for result in entry.get("draw_results") or []:
+                    numbers.extend(result.get("result_numbers") or [])
+                prize_label = PRIZE_DISPLAY_LABELS.get(level, entry.get("prize_name") or level.title())
+                prizes.append(
+                    PrizeSummary(
+                        label=prize_label,
+                        level=level,
+                        numbers=numbers,
+                    )
+                )
+
+        summaries.append(
+            DrawSummary(
+                region=region,
+                region_label=region_info["label"],
+                province_code=province_code,
+                province_name=province_name,
+                operator=game.get("operator"),
+                game_code=game.get("code"),
+                game_name=game.get("name"),
+                sequence=item.get("sequence") or 1,
+                prizes=prizes,
+                source_url=item.get("source_url"),
+            )
+        )
+
+    summaries.sort(key=lambda draw: (draw.sequence, draw.province_name))
+    return summaries
+
+
+def render_summary_text(
+    draw_date: dt.date,
+    requested_region: Optional[str],
+    draws: List[DrawSummary],
+) -> str:
+    date_label = draw_date.strftime("%d/%m/%Y")
+    if requested_region:
+        title_label = REGION_CONFIG[requested_region]["label"]
+    else:
+        title_label = "3 Miền"
+
+    if not draws:
+        return f"🎯 Chưa có dữ liệu kết quả xổ số {title_label} cho ngày {date_label}."
+
+    lines: List[str] = [f"🎯 Kết quả Xổ Số {title_label} – {date_label}"]
+    multiple_regions = len({draw.region for draw in draws}) > 1
+    draws_sorted = sorted(
+        draws,
+        key=lambda draw: (
+            REGION_ORDER.get(draw.region, 99),
+            draw.sequence,
+            draw.province_name,
+        ),
+    )
+
+    for draw in draws_sorted:
+        lines.append("")
+        details: List[str] = []
+        formatted_code = format_game_code(draw.game_code)
+        if formatted_code:
+            details.append(formatted_code)
+        if draw.operator:
+            details.append(draw.operator)
+        header = draw.province_name
+        if multiple_regions:
+            header = f"{draw.region_label} – {header}"
+        if details:
+            header = f"{header} ({' – '.join(details)})"
+        lines.append(header)
+
+        for prize in draw.prizes:
+            numbers_text = " – ".join(prize.numbers) if prize.numbers else "Đang cập nhật"
+            lines.append(f"{prize.label}: {numbers_text}")
+
+    return "\n".join(lines)
+
+
+app = FastAPI(title="KQSX API", version="0.1.0")
+
+
+@app.get("/healthz")
+def healthcheck() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get(
+    "/privacy_policy",
+    response_model=PrivacyPolicyResponse,
+)
+def privacy_policy() -> PrivacyPolicyResponse:
+    today_iso = dt.date.today().isoformat()
+    return PrivacyPolicyResponse(
+        title="Chính sách quyền riêng tư",
+        description=(
+            "Ứng dụng này chỉ thu thập và hiển thị dữ liệu kết quả xổ số được cung cấp từ Supabase. "
+            "Chúng tôi không yêu cầu, lưu trữ hay xử lý thông tin cá nhân của người dùng."
+        ),
+        data_usage=(
+            "Dữ liệu được sử dụng duy nhất để phản hồi câu hỏi về kết quả xổ số. "
+            "Không có dữ liệu cá nhân hay hành vi người dùng nào được thu thập."
+        ),
+        limitations=(
+            "Kết quả xổ số được cung cấp mang tính tham khảo. Người dùng nên đối chiếu với nguồn chính thức "
+            "khi cần xác minh."
+        ),
+        contact="Liên hệ: support@kqsx.local",
+        last_updated=today_iso,
+    )
+
+
+@app.get(
+    "/v1/kqsx/summary",
+    response_model=LotterySummaryResponse,
+    response_model_exclude_none=True,
+)
+def get_lottery_summary(
+    date: Annotated[
+        Optional[str],
+        Query(description="Ngày kết quả (YYYY-MM-DD). Mặc định là hôm nay."),
+    ] = None,
+    region: Annotated[
+        Optional[str],
+        Query(
+            pattern="^(mn|mt|mb)$",
+            description="mn (Miền Nam), mt (Miền Trung), mb (Miền Bắc). Bỏ trống để lấy tất cả.",
+        ),
+    ] = None,
+) -> LotterySummaryResponse:
+    requested_date = parse_date(date)
+    regions_to_fetch = [region] if region else list(REGION_CONFIG.keys())
+    resolved_date, fallback_offset, region_draws = gather_draws_for_regions(requested_date, regions_to_fetch)
+
+    draw_summaries: List[DrawSummary] = []
+    for region_key, draw_items in region_draws.items():
+        draw_summaries.extend(build_draw_summaries(draw_items, region_key))
+
+    if region:
+        region_value = region
+        region_label = REGION_CONFIG[region]["label"]
+    else:
+        region_value = "all"
+        region_label = "3 Miền"
+    summary_text = render_summary_text(resolved_date, region, draw_summaries)
+
+    return LotterySummaryResponse(
+        requested_date=requested_date.isoformat(),
+        date=resolved_date.isoformat(),
+        region=region_value,
+        region_label=region_label,
+        draws=draw_summaries,
+        summary_text=summary_text,
+        fallback_offset_days=fallback_offset,
+    )

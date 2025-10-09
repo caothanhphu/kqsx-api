@@ -1,0 +1,7 @@
+requests
+beautifulsoup4
+python-slugify
+langchain-core
+scrapegraphai
+fastapi
+uvicorn
