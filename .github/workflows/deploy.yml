@@ -1,0 +1,40 @@
+name: Deploy kqsx-api to Ubuntu
+
+on:
+  push:
+    branches: [ "main" ]   # đổi nếu bạn deploy từ nhánh khác
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add server to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ secrets.SSH_PORT || '22' }}" -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: SSH → git pull → docker build → restart service
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          script: |
+            set -e
+            cd "${{ secrets.APP_DIR }}"    # ví dụ: /home/deploy/app
+            # an toàn hơn pull: luôn bám theo origin/main
+            git fetch origin
+            git reset --hard origin/main
+
+            # build image local trên server
+            docker build -t kqsx-api:latest .
+
+            # (tuỳ) chạy migrate, collectstatic... nếu cần
+            # docker run --rm kqsx-api:latest alembic upgrade head
+
+            # restart service đang quản lý container
+            sudo systemctl restart kqsx-api
+
+            # (tuỳ) dọn ảnh rác
+            docker image prune -f
