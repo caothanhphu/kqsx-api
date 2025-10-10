@@ -89,8 +89,28 @@ PROVINCE_OVERRIDES: Dict[str, Dict[str, Dict[str, str]]] = {
 }
 
 REGION_PRIZE_ORDER: Dict[str, List[str]] = {
-    "mn": PRIZE_ORDER,
-    "mt": PRIZE_ORDER,
+    "mn": [
+        "eighth",
+        "seventh",
+        "sixth",
+        "fifth",
+        "fourth",
+        "third",
+        "second",
+        "first",
+        "special",
+    ],
+    "mt": [
+        "eighth",
+        "seventh",
+        "sixth",
+        "fifth",
+        "fourth",
+        "third",
+        "second",
+        "first",
+        "special",
+    ],
     "mb": [
         "special",
         "first",
@@ -499,6 +519,12 @@ def build_source_url(date_str):
     # MinhChinh format: DD-MM-YYYY
     d = dt.datetime.fromisoformat(date_str)
     return f"https://www.minhchinh.com/ket-qua-xo-so/{d.strftime('%d-%m-%Y')}.html"
+
+
+def build_canonical_source_url(date_str: str) -> str:
+    d = dt.datetime.fromisoformat(date_str)
+    return f"https://kqxs.pmsa.com.vn/kqxs/{d.strftime('%Y-%m-%d')}"
+
 
 def normalize_items(items, region_short, date_str, source_url):
     """Điền đủ các field game_code/name, operator, slug code..."""
@@ -963,12 +989,13 @@ def publish_to_supabase(data_array: List[dict], region_short: str, date_str: str
 
 def run(date_str: str, region_short: str, out_path: Optional[str] = None, use_supabase: bool = True):
     assert region_short in ("mb", "mt", "mn"), "region must be one of: mb, mt, mn"
-    source_url = build_source_url(date_str)
+    scrape_url = build_source_url(date_str)
+    canonical_source_url = build_canonical_source_url(date_str)
 
     if region_short in {"mn", "mt"}:
-        raw_items = scrape_region(date_str, source_url, region_short)
+        raw_items = scrape_region(date_str, scrape_url, region_short)
     elif region_short == "mb":
-        raw_items = scrape_mien_bac(date_str, source_url)
+        raw_items = scrape_mien_bac(date_str, scrape_url)
     else:
         ensure_ollama_host()
         region_label = vn_region_label(region_short)
@@ -976,14 +1003,14 @@ def run(date_str: str, region_short: str, out_path: Optional[str] = None, use_su
         prompt = PROMPT_TEMPLATE + f"""
 
 Requested region: {region_short} ({region_label})
-Page URL: {source_url}
+Page URL: {scrape_url}
 Target date (draw_date): {date_str}
 """
 
         base_config = build_graph()
         graph = SmartScraperGraph(
             prompt=prompt,
-            source=source_url,
+            source=scrape_url,
             config=base_config
         )
         try:
@@ -993,7 +1020,7 @@ Target date (draw_date): {date_str}
             retry_prompt = prompt + "\n\nReturn ONLY a valid JSON array. Do not include commentary or explanations."
             graph = SmartScraperGraph(
                 prompt=retry_prompt,
-                source=source_url,
+                source=scrape_url,
                 config=base_config
             )
             raw = graph.run()
@@ -1024,11 +1051,11 @@ Target date (draw_date): {date_str}
 
         raw_items = parsed_raw
 
-    data_array = normalize_items(raw_items, region_short, date_str, source_url)
+    data_array = normalize_items(raw_items, region_short, date_str, canonical_source_url)
 
     supabase_stats: Optional[Dict[str, int]] = None
     if use_supabase:
-        supabase_stats = publish_to_supabase(data_array, region_short, date_str, source_url)
+        supabase_stats = publish_to_supabase(data_array, region_short, date_str, canonical_source_url)
         print(
             f"Supabase upload complete: {supabase_stats['draws']} draws, "
             f"{supabase_stats['prizes']} prizes, {supabase_stats['results']} results."
