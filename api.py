@@ -4,7 +4,7 @@ import os
 import random
 from functools import lru_cache
 from typing import Annotated, Any, Dict, Iterable, List, Optional, Set, Tuple
-from threading import RLock
+from threading import Event, RLock, Thread
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
@@ -162,11 +162,15 @@ REGION_CONFIG: Dict[str, Dict[str, Any]] = {
 
 
 DEFAULT_FALLBACK_DAYS = 2
+HOURLY_CHECK_INTERVAL_SECONDS = 60 * 60
+REGION_CHECK_SEQUENCE = ["mb", "mt", "mn"]
 REGION_ORDER = {region_key: idx for idx, region_key in enumerate(REGION_CONFIG.keys())}
 
 CACHE_TTL_SECONDS = 60 * 60 * 24 * 10  # 10 days
 _draw_cache: TTLCache = TTLCache(maxsize=512, ttl=CACHE_TTL_SECONDS)
 _cache_lock = RLock()
+_hourly_stop_event: Event = Event()
+_hourly_thread: Optional[Thread] = None
 
 
 def cache_key(date_value: dt.date, region: str) -> str:
@@ -292,6 +296,61 @@ def trigger_scrape_for_region(target_date: dt.date, region: str) -> bool:
             exc,
         )
         return False
+
+
+def ensure_today_draws_available(now: Optional[dt.datetime] = None) -> None:
+    """Check current-day draws per region and trigger scraper when missing."""
+    target_date = (now or dt.datetime.now()).date()
+    for region in REGION_CHECK_SEQUENCE:
+        try:
+            draws = fetch_draws_for_date(target_date, region)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Background check failed to fetch draws for region=%s date=%s",
+                region,
+                target_date.isoformat(),
+            )
+            continue
+
+        if draws:
+            logger.debug(
+                "Background check: data already present for region=%s date=%s",
+                region,
+                target_date.isoformat(),
+            )
+            continue
+
+        logger.info(
+            "Background check: missing draws for region=%s date=%s, triggering scraper.",
+            region,
+            target_date.isoformat(),
+        )
+        success = trigger_scrape_for_region(target_date, region)
+        if not success:
+            logger.warning(
+                "Background scraper attempt failed for region=%s date=%s",
+                region,
+                target_date.isoformat(),
+            )
+
+
+def _hourly_scrape_worker(stop_event: Event) -> None:
+    """Loop that ensures current-day data is refreshed roughly once per hour."""
+    logger.info("Starting hourly scraper watchdog thread.")
+    while not stop_event.is_set():
+        cycle_started = dt.datetime.now()
+        try:
+            ensure_today_draws_available(now=cycle_started)
+        except Exception:  # noqa: BLE001
+            logger.exception("Unexpected error during hourly scraper check.")
+
+        elapsed = (dt.datetime.now() - cycle_started).total_seconds()
+        remaining = HOURLY_CHECK_INTERVAL_SECONDS - elapsed
+        if remaining <= 0:
+            remaining = HOURLY_CHECK_INTERVAL_SECONDS
+        if stop_event.wait(remaining):
+            break
+    logger.info("Hourly scraper watchdog thread stopped.")
 
 
 def gather_draws_for_regions(
@@ -459,6 +518,40 @@ def render_summary_text(
 
 
 app = FastAPI(title="KQSX API", version="0.1.0")
+
+
+@app.on_event("startup")
+def start_hourly_watchdog() -> None:
+    """Start the background thread that keeps daily data fresh."""
+    global _hourly_thread  # noqa: PLW0603
+    if _hourly_thread and _hourly_thread.is_alive():
+        return
+
+    _hourly_stop_event.clear()
+    try:
+        ensure_today_draws_available()
+    except Exception:  # noqa: BLE001
+        logger.exception("Initial hourly scraper check failed during startup.")
+
+    thread = Thread(
+        target=_hourly_scrape_worker,
+        args=(_hourly_stop_event,),
+        name="hourly-scraper-watchdog",
+        daemon=True,
+    )
+    thread.start()
+    _hourly_thread = thread
+
+
+@app.on_event("shutdown")
+def stop_hourly_watchdog() -> None:
+    """Gracefully stop the background thread when the app shuts down."""
+    global _hourly_thread  # noqa: PLW0603
+    _hourly_stop_event.set()
+    thread = _hourly_thread
+    if thread and thread.is_alive():
+        thread.join(timeout=10)
+    _hourly_thread = None
 
 
 @app.get("/healthz")
