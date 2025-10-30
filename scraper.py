@@ -5,35 +5,10 @@ import os
 import sys
 import unicodedata
 from typing import Any, Dict, List, Optional, Sequence
-from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from slugify import slugify
-from langchain_core.exceptions import OutputParserException
-
-from scrapegraphai.graphs import SmartScraperGraph
-
-
-def ensure_ollama_host():
-    """Normalize OLLAMA_HOST so local clients can reach the server."""
-    default_host = "http://127.0.0.1:11434"
-    raw_host = os.environ.get("OLLAMA_HOST", default_host).strip()
-    host_url = raw_host or default_host
-
-    if "://" not in host_url:
-        host_url = f"http://{host_url}"
-
-    parsed = urlparse(host_url)
-    hostname = parsed.hostname or "127.0.0.1"
-
-    if hostname in {"0.0.0.0", "::", "[::]"}:
-        hostname = "127.0.0.1"
-
-    port = parsed.port or 11434
-    normalized = f"http://{hostname}:{port}"
-    os.environ["OLLAMA_HOST"] = normalized
-    return normalized
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -447,60 +422,6 @@ def scrape_mien_bac(date_str: str, source_url: str) -> List[dict]:
         )
 
     return [province]
-
-# -------- Graph Configuration --------
-def build_graph():
-    """
-    SmartScraperGraph runs a local Llama3 via Ollama.
-    Output: JSON following the schema described in the prompt.
-    """
-    graph_config = {
-        "llm": {
-            "model": "ollama/llama3",
-            "temperature": 0.0,
-            "format": "json",
-        },
-        "embeddings": {
-            "model": "ollama/nomic-embed-text"
-        },
-        "verbose": False,
-        "headless": True,    # avoid opening a visible browser
-        "max_tokens": 4096,
-    }
-    return graph_config
-
-# -------- Prompt trích xuất KQSX từ MinhChinh --------
-PROMPT_TEMPLATE = """
-You are a precise web data extractor for Vietnamese lottery results.
-From the given MinhChinh daily results page, extract ALL results for the requested REGION ONLY.
-Return a strict JSON array (no commentary) where each item has:
-- code: machine slug of province, e.g. "ben_tre"
-- name: province display name, e.g. "Ben Tre"
-- operator: "XSKT <Province>"
-- game_code: "xs_{region}_{code}"
-- game_name: "XS {Region VN Label} - {Province Name}"
-- source_url: the url you scraped
-- draw_date: ISO date YYYY-MM-DD
-- sequence: 1
-- results: array of objects with fields:
-  prize_level in ["eighth","seventh","sixth","fifth","fourth","third","second","first","special"]
-  prize_order: 1
-  prize_name: Vietnamese label e.g. "Giai tam","Giai dac biet"
-  numbers: array of strings (the winning numbers for that prize row, preserve leading zeros)
-
-REGION mapping:
-- "mb" -> Miền Bắc (single board)
-- "mt" -> Miền Trung (multiple boards)
-- "mn" -> Miền Nam (multiple boards)
-
-Rules:
-- Only include provinces/boards that belong to the requested region for that date.
-- Keep number strings EXACTLY as displayed (preserve leading zeros).
-- If multiple numbers appear on a row, put them all in the "numbers" array for that prize.
-- Prize labels must follow the region's convention (Miền Nam/Trung: eighth..special; Miền Bắc: seven..special mapping accordingly).
-
-Return ONLY valid JSON.
-"""
 
 # -------- Map region info cho SQL (schedule/metadata) --------
 REGION_META = {
@@ -992,64 +913,10 @@ def run(date_str: str, region_short: str, out_path: Optional[str] = None, use_su
     scrape_url = build_source_url(date_str)
     canonical_source_url = build_canonical_source_url(date_str)
 
-    if region_short in {"mn", "mt"}:
-        raw_items = scrape_region(date_str, scrape_url, region_short)
-    elif region_short == "mb":
+    if region_short == "mb":
         raw_items = scrape_mien_bac(date_str, scrape_url)
     else:
-        ensure_ollama_host()
-        region_label = vn_region_label(region_short)
-
-        prompt = PROMPT_TEMPLATE + f"""
-
-Requested region: {region_short} ({region_label})
-Page URL: {scrape_url}
-Target date (draw_date): {date_str}
-"""
-
-        base_config = build_graph()
-        graph = SmartScraperGraph(
-            prompt=prompt,
-            source=scrape_url,
-            config=base_config
-        )
-        try:
-            raw = graph.run()
-        except OutputParserException:
-            print("Initial scrape response was not valid JSON. Retrying with stricter instructions...")
-            retry_prompt = prompt + "\n\nReturn ONLY a valid JSON array. Do not include commentary or explanations."
-            graph = SmartScraperGraph(
-                prompt=retry_prompt,
-                source=scrape_url,
-                config=base_config
-            )
-            raw = graph.run()
-
-        parsed_raw = raw
-        if isinstance(raw, str):
-            try:
-                parsed_raw = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise ValueError("Expected JSON string from SmartScraperGraph.") from exc
-
-        if isinstance(parsed_raw, dict):
-            parsed_raw = (
-                parsed_raw.get("result")
-                or parsed_raw.get("content")
-                or parsed_raw.get("data")
-                or parsed_raw
-            )
-
-        if isinstance(parsed_raw, str):
-            try:
-                parsed_raw = json.loads(parsed_raw)
-            except json.JSONDecodeError as exc:
-                raise ValueError("Graph returned nested string that is not valid JSON.") from exc
-
-        if not isinstance(parsed_raw, list):
-            raise ValueError(f"Expected list of province entries, received {type(parsed_raw).__name__}")
-
-        raw_items = parsed_raw
+        raw_items = scrape_region(date_str, scrape_url, region_short)
 
     data_array = normalize_items(raw_items, region_short, date_str, canonical_source_url)
 
